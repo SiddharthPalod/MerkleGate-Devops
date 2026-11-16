@@ -1,0 +1,42 @@
+# Binaries and compiled output
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace and dependencies
+go.work
+go.work.sum
+vendor/
+
+# Local runtime data & storage (C2SP tiles, raw chunks)
+data/
+tiles/
+chunks/
+*.tmp
+*.log
+
+# Cryptographic keys and secrets (NEVER commit private keys)
+keys/
+*.key
+*.pem
+*.priv
+.env
+.env.*
+
+# Container and volume artifacts
+redis_data/
+kafka_data/
+
+# IDE and OS artifacts
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

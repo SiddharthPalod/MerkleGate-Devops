@@ -1,0 +1,10 @@
+bin/
+.git/
+.tmp/
+*.tmp
+data/
+keys/
+*.key
+*.exe
+.idea/
+.vscode/
