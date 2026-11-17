@@ -66,17 +66,23 @@ This plan pairs high-throughput micro-batch ingestion with binary Merkle trees a
 
 ---
 
-## Phase 3: Auditor Verification Gateway & Receipt Engine
+## Phase 3: Auditor Verification Gateway & Receipt Engine ✅ [COMPLETED]
 
 **Objective:** Expose an external verification API and standalone CLI tool that allows internal security teams and external regulators (PCI DSS, FedRAMP, ISO 27001 auditors) to independently verify log integrity without accessing raw internal databases.
 
-* **Self-Contained "Compliance Receipt" JSON Format:** When an event is queried, output a cryptographic receipt containing:
-  1. The raw event payload.
-  2. Its computed leaf hash and position index.
-  3. The Merkle inclusion audit path.
-  4. The latest Signed Tree Head (STH) signed by the organization's root key.
-* **Offline Verification CLI / Verifier Tool:** Build a lightweight standalone verifier script that takes a compliance receipt, recalculates the Merkle path hashes locally, compares the derived root against the signed STH, and validates the Ed25519 signature—completely isolated from the server backend.
-* **Auditor Dashboard / API Endpoints:** Provide REST endpoints for batch verification, historical tree consistency proof checks, and automated compliance report generation.
+* **Self-Contained "Compliance Receipt" Composite Format (`pkg/receipt/receipt.go`):**
+  * Bundles raw event payload, RFC 6962 leaf hash, Merkle inclusion audit path for historical epoch $M$, RFC 9162 consistency proof bridging $\text{Tree}_M \subseteq \text{Tree}_N$, and Ed25519 Signed Tree Head ($\text{STH}_N$).
+  * Reuses pure crypto primitives from `pkg/merkle` and `pkg/signer` with zero duplicate math.
+  * Verified in `receipt_test.go` across same-size trees, historical tree growth, single-bit payload tampers, audit path corruption, and rogue public keys.
+* **Offline Standalone Auditor CLI (`cmd/auditor/main.go`):**
+  * Zero-dependency CLI tool compiled as `bin/auditor.exe` for air-gapped auditor verification:
+    * `auditor verify <receipt.json> --pubkey <key-or-file>`
+    * `auditor pubkey <ed25519.key> [--out ed25519.pub]`
+  * Step-by-step audit verdict with pass/fail diagnostics.
+* **Server Verification Gateway & Export Endpoints (`cmd/daemon/main.go`, `cmd/visualizer/main.go`):**
+  * `GET /api/v1/receipt/:leafIndex` serves downloadable compliance receipts.
+  * `POST /api/v1/receipt/verify` provides server-side receipt verification.
+  * Visualizer inspector upgraded with **"📥 Export Cryptographic Receipt (.json)"** button to export and audit receipts directly in the standalone CLI.
 
 ---
 

@@ -43,7 +43,7 @@ services:
       dockerfile: Dockerfile
     container_name: merklegate-server
     ports:
-      - "8080:8080"
+      - "8083:8083"
     environment:
       - REDIS_ADDR=redis:6379
       - KAFKA_BROKERS=kafka:29092

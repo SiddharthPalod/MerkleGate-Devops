@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"merklegate/pkg/dedup"
 	"merklegate/pkg/indexer"
 	"merklegate/pkg/merkle"
+	"merklegate/pkg/receipt"
 	"merklegate/pkg/signer"
 	"merklegate/pkg/storage"
 )
@@ -55,8 +57,12 @@ func NewServer() *Server {
 	driver, _ := storage.NewFileStorageDriver(tempDir)
 	store := storage.NewTileStore(driver)
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 	var redisIdx indexer.Indexer
-	rClient := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rClient := redis.NewClient(&redis.Options{Addr: redisAddr})
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	if err := rClient.Ping(pingCtx).Err(); err == nil {
 		redisIdx = indexer.NewRedisIndexer(rClient)
@@ -203,8 +209,20 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 		sthValid = s.signer.VerifyTreeHead(s.latestSTH) && !s.isTampered
 	}
 
+	total := len(s.events)
+	tileIdx := total / storage.TileWidth
+	partialWidth := total % storage.TileWidth
+	chunkIdx := tileIdx
+	if partialWidth == 0 && total > 0 {
+		tileIdx--
+		partialWidth = storage.TileWidth
+		chunkIdx = tileIdx
+	}
+	latestTile := storage.TilePath(0, tileIdx, partialWidth)
+	latestChunk := storage.ChunkPath(chunkIdx)
+
 	resp := map[string]interface{}{
-		"size":              len(s.events),
+		"size":              total,
 		"isTampered":        s.isTampered,
 		"rootHash":          hex.EncodeToString(s.tree.Root.Hash),
 		"root":              rootDTO,
@@ -212,7 +230,8 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 		"sth":               s.latestSTH,
 		"sthValid":          sthValid,
 		"redisOnline":       s.redisIdx != nil,
-		"c2spTile":          storage.TilePath(0, 0, len(s.events)),
+		"c2spTile":          latestTile,
+		"c2spChunk":         latestChunk,
 		"events": func() []string {
 			var list []string
 			for _, e := range s.events {
@@ -374,40 +393,122 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.redisIdx == nil {
-		http.Error(w, "Redis indexer is offline", http.StatusServiceUnavailable)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"indices":       []int{},
+			"matchedHashes": []string{},
+			"message":       "empty query",
+		})
 		return
 	}
 
-	query := r.URL.Query().Get("q")
-	kind := r.URL.Query().Get("type")
+	indexMap := make(map[int]bool)
+	var matchedHashes []string
 
-	var indices []int
-	var err error
-
-	switch kind {
-	case "commit":
-		indices, err = s.redisIdx.FindByCommit(r.Context(), query)
-	case "pr":
-		num, _ := strconv.Atoi(query)
-		indices, err = s.redisIdx.FindByPR(r.Context(), num)
-	case "actor":
-		indices, err = s.redisIdx.FindByActor(r.Context(), query)
-	default:
-		indices, err = s.redisIdx.FindByCommit(r.Context(), query)
+	// 1. Check Redis indexer (Commit, PR, Actor)
+	if s.redisIdx != nil {
+		if cIndices, err := s.redisIdx.FindByCommit(r.Context(), query); err == nil {
+			for _, idx := range cIndices {
+				indexMap[idx] = true
+			}
+		}
+		if aIndices, err := s.redisIdx.FindByActor(r.Context(), query); err == nil {
+			for _, idx := range aIndices {
+				indexMap[idx] = true
+			}
+		}
+		if num, err := strconv.Atoi(query); err == nil {
+			if prIndices, err := s.redisIdx.FindByPR(r.Context(), num); err == nil {
+				for _, idx := range prIndices {
+					indexMap[idx] = true
+				}
+			}
+		}
 	}
 
+	// 2. Check SHA-256 Digests (Root, Internal Nodes, Leaves)
+	lowerQ := strings.ToLower(query)
+	for i, e := range s.events {
+		leafHashHex := strings.ToLower(hex.EncodeToString(s.hasher.HashLeaf(e)))
+		if strings.HasPrefix(leafHashHex, lowerQ) || strings.Contains(leafHashHex, lowerQ) {
+			indexMap[i] = true
+			matchedHashes = append(matchedHashes, leafHashHex)
+		}
+		if strings.Contains(strings.ToLower(string(e)), lowerQ) {
+			indexMap[i] = true
+		}
+	}
+
+	if s.tree != nil && s.tree.Root != nil {
+		rootHashHex := strings.ToLower(hex.EncodeToString(s.tree.Root.Hash))
+		if strings.HasPrefix(rootHashHex, lowerQ) || strings.Contains(rootHashHex, lowerQ) {
+			matchedHashes = append(matchedHashes, rootHashHex)
+		}
+	}
+
+	var indices []int
+	for idx := range indexMap {
+		indices = append(indices, idx)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"query":         query,
+		"indices":       indices,
+		"matchedHashes": matchedHashes,
+		"count":         len(indices) + len(matchedHashes),
+	})
+}
+
+func (s *Server) handleGetReceipt(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	idxStr := r.URL.Query().Get("leafIndex")
+	if idxStr == "" {
+		idxStr = strings.TrimPrefix(r.URL.Path, "/api/v1/receipt/")
+	}
+	leafIdx, err := strconv.Atoi(idxStr)
+	if err != nil || leafIdx < 0 || leafIdx >= len(s.events) {
+		http.Error(w, "invalid leafIndex", http.StatusBadRequest)
+		return
+	}
+
+	inclProof, err := s.tree.GenerateInclusionProof(leafIdx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rcpt, err := receipt.BuildReceipt(leafIdx, s.events[leafIdx], inclProof, nil, nil, s.latestSTH)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"query":   query,
-		"type":    kind,
-		"indices": indices,
-	})
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=receipt-leaf-%d.json", leafIdx))
+	json.NewEncoder(w).Encode(rcpt)
+}
+
+func (s *Server) handleVerifyReceipt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var rcpt receipt.ComplianceReceipt
+	if err := json.NewDecoder(r.Body).Decode(&rcpt); err != nil {
+		http.Error(w, "invalid receipt json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	pubKey := s.signer.PublicKey()
+	report := receipt.Verify(pubKey, &rcpt)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(report)
 }
 
 func main() {
@@ -420,6 +521,8 @@ func main() {
 	http.HandleFunc("/api/proof/inclusion", server.handleInclusionProof)
 	http.HandleFunc("/api/proof/consistency", server.handleConsistencyProof)
 	http.HandleFunc("/api/search", server.handleSearch)
+	http.HandleFunc("/api/v1/receipt/", server.handleGetReceipt)
+	http.HandleFunc("/api/v1/receipt/verify", server.handleVerifyReceipt)
 
 	subFS, err := fs.Sub(webFS, "web")
 	if err != nil {

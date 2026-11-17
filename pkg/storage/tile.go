@@ -125,12 +125,38 @@ func (ts *TileStore) SaveLeaves(startLeafIndex int, leafHashes [][]byte, rawEven
 		return nil
 	}
 
-	// 1. Persist Raw Event Chunk
+	// 1. Persist Raw Event Chunks (chunked by TileWidth = 256)
 	if len(rawEvents) > 0 {
-		chunkIndex := startLeafIndex / TileWidth
-		chunkBytes := serializeChunk(rawEvents)
-		if err := ts.driver.Write(ChunkPath(chunkIndex), chunkBytes, false); err != nil {
-			return fmt.Errorf("failed to write event chunk: %w", err)
+		cOffset := 0
+		for cOffset < len(rawEvents) {
+			currentIdx := startLeafIndex + cOffset
+			chunkIdx := currentIdx / TileWidth
+			posInChunk := currentIdx % TileWidth
+
+			remaining := TileWidth - posInChunk
+			toWrite := len(rawEvents) - cOffset
+			if toWrite > remaining {
+				toWrite = remaining
+			}
+
+			var chunkEvents [][]byte
+			chunkFile := ChunkPath(chunkIdx)
+			if posInChunk > 0 && ts.driver.Exists(chunkFile) {
+				if existingData, err := ts.driver.Read(chunkFile); err == nil {
+					if existingEvents, err := DeserializeChunk(existingData); err == nil {
+						chunkEvents = existingEvents
+					}
+				}
+			}
+
+			chunkEvents = append(chunkEvents, rawEvents[cOffset:cOffset+toWrite]...)
+			chunkBytes := serializeChunk(chunkEvents)
+			isFullChunk := (len(chunkEvents) == TileWidth)
+			if err := ts.driver.Write(chunkFile, chunkBytes, isFullChunk); err != nil {
+				return fmt.Errorf("failed to write event chunk: %w", err)
+			}
+
+			cOffset += toWrite
 		}
 	}
 

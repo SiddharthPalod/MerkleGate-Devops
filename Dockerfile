@@ -20,6 +20,6 @@ COPY --from=builder /bin/visualizer /app/visualizer
 # Mountable directories for tiles and keys
 VOLUME ["/app/data", "/app/keys"]
 
-EXPOSE 8080
+EXPOSE 8083
 
 ENTRYPOINT ["/app/visualizer"]

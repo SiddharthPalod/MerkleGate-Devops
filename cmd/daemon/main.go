@@ -19,6 +19,7 @@ import (
 
 	"merklegate/pkg/indexer"
 	"merklegate/pkg/pipeline"
+	"merklegate/pkg/receipt"
 	"merklegate/pkg/signer"
 	"merklegate/pkg/storage"
 )
@@ -31,7 +32,7 @@ func getEnv(key, defaultVal string) string {
 }
 
 func main() {
-	portStr := getEnv("PORT", "8080")
+	portStr := getEnv("PORT", "8083")
 	port, _ := strconv.Atoi(portStr)
 	kafkaBrokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
 	kafkaTopic := getEnv("KAFKA_TOPIC", "compliance-events")
@@ -223,6 +224,21 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status": "published_to_kafka",
 		})
+	})
+
+	mux.HandleFunc("/api/v1/receipt/verify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var rcpt receipt.ComplianceReceipt
+		if err := json.NewDecoder(r.Body).Decode(&rcpt); err != nil {
+			http.Error(w, "invalid receipt: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		report := receipt.Verify(localSigner.PublicKey(), &rcpt)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(report)
 	})
 
 	server := &http.Server{
