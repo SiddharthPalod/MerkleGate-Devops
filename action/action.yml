@@ -1,0 +1,32 @@
+name: 'MerkleGate Deployment Guardrail'
+description: 'Enterprise cryptographic compliance guardrail enforcing RFC 6962 and RFC 9162 Merkle tree proofs and PR approval policies before deployment.'
+author: 'MerkleGate'
+
+inputs:
+  merkle-endpoint:
+    description: 'URL of the MerkleGate ledger server'
+    required: true
+    default: 'http://localhost:8083'
+  commit-sha:
+    description: 'Commit SHA to verify against the ledger'
+    required: true
+    default: ${{ github.sha }}
+  public-key:
+    description: 'Hex-encoded Ed25519 public key of the STH signer for offline cryptographic verification'
+    required: false
+  required-policies:
+    description: 'Comma-separated compliance event types required for approval (e.g. "git_commit,pr_approval,snyk_scan")'
+    required: false
+    default: 'git_commit,pr_approval'
+  fail-closed:
+    description: 'If true, blocks deployment (exit 1) on missing or invalid proofs; if false, logs warning'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'node20'
+  main: 'index.js'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
