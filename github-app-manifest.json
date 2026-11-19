@@ -1,0 +1,24 @@
+{
+  "name": "MerkleGate Compliance Ledger",
+  "url": "https://github.com/org/merklegate",
+  "hook_attributes": {
+    "url": "https://merklegate.example.com/api/v1/webhooks/github",
+    "active": true
+  },
+  "redirect_url": "https://merklegate.example.com/setup/github/callback",
+  "description": "Enterprise streaming verifiable compliance ledger adhering to RFC 6962 and RFC 9162 specifications. Automatically hashes and audits Git commits, PR approvals, and security scans.",
+  "public": true,
+  "default_permissions": {
+    "contents": "read",
+    "pull_requests": "read",
+    "actions": "read",
+    "checks": "read"
+  },
+  "default_events": [
+    "push",
+    "pull_request",
+    "pull_request_review",
+    "workflow_run",
+    "check_run"
+  ]
+}

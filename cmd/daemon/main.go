@@ -17,6 +17,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"merklegate/pkg/githubapp"
 	"merklegate/pkg/indexer"
 	"merklegate/pkg/pipeline"
 	"merklegate/pkg/receipt"
@@ -40,6 +41,7 @@ func main() {
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 	dataDir := getEnv("DATA_DIR", "./data")
 	keysDir := getEnv("KEYS_DIR", "./keys")
+	githubWebhookSecret := getEnv("GITHUB_WEBHOOK_SECRET", "")
 
 	var brokers []string
 	if kafkaBrokersStr != "" {
@@ -239,6 +241,167 @@ func main() {
 		report := receipt.Verify(localSigner.PublicKey(), &rcpt)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(report)
+	})
+
+	// 7. GitHub App Webhook Receiver & Manifest Onboarding
+	ghReceiver := githubapp.NewReceiver(githubapp.Config{
+		WebhookSecret: githubWebhookSecret,
+		Producer:      producer,
+	})
+	mux.Handle("/api/v1/webhooks/github", ghReceiver)
+
+	mux.HandleFunc("/setup/github", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+  <title>MerkleGate GitHub App 1-Click Setup</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 640px; width: 100%%; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+    h1 { color: #58a6ff; font-size: 24px; margin-top: 0; display: flex; align-items: center; gap: 8px; }
+    p { line-height: 1.6; color: #8b949e; font-size: 14px; }
+    label { display: block; font-size: 12px; font-weight: 600; text-transform: uppercase; color: #8b949e; margin-top: 16px; margin-bottom: 6px; }
+    input { width: 100%%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; color: #c9d1d9; font-size: 14px; box-sizing: border-box; outline: none; }
+    input:focus { border-color: #58a6ff; }
+    .hint { font-size: 12px; color: #7ee787; margin-top: 6px; display: block; }
+    .hint a { color: #58a6ff; text-decoration: underline; }
+    .btn { background: #238636; color: white; border: none; padding: 12px 24px; font-size: 16px; font-weight: 600; border-radius: 6px; cursor: pointer; transition: background 0.2s; width: 100%%; margin-top: 24px; }
+    .btn:hover { background: #2ea043; }
+    .badge { display: inline-block; background: #1f6feb22; border: 1px solid #1f6feb55; color: #58a6ff; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🛡️ MerkleGate GitHub App Setup</h1>
+    <p>Register the MerkleGate GitHub App on GitHub. Once installed on your repos, it streams <strong>pushes</strong>, <strong>PR approvals</strong>, and <strong>security scans</strong> into the verifiable compliance ledger.</p>
+    
+    <div>
+      <label>1. GitHub App Name <span class="badge">Must be unique on GitHub</span></label>
+      <input id="appName" value="MerkleGate-Ledger" />
+    </div>
+
+    <div>
+      <label>2. Public Webhook URL <span class="badge">HTTPS required by GitHub</span></label>
+      <input id="webhookUrl" placeholder="https://your-domain.com/api/v1/webhooks/github or https://smee.io/..." />
+      <span class="hint">⚡ Testing locally? Get an instant free public proxy at <a href="https://smee.io/new" target="_blank">smee.io/new</a> (no account needed) and paste the URL here.</span>
+    </div>
+
+    <form id="manifestForm" action="https://github.com/settings/apps/new" method="post" target="_blank">
+      <input type="hidden" name="manifest" id="manifestPayload" value="" />
+      <button type="submit" class="btn">🚀 Register GitHub App on GitHub</button>
+    </form>
+  </div>
+
+  <script>
+    // Randomize default name so it doesn't collide on GitHub
+    const rand = Math.random().toString(36).substring(2, 6);
+    document.getElementById('appName').value = 'MerkleGate-' + rand;
+
+    document.getElementById('manifestForm').addEventListener('submit', function(e) {
+      const name = document.getElementById('appName').value.trim() || ('MerkleGate-' + rand);
+      let hookUrl = document.getElementById('webhookUrl').value.trim();
+      
+      if (!hookUrl || !hookUrl.startsWith('https://')) {
+        alert('GitHub requires a public HTTPS URL for webhooks.\n\nFor local testing, click the smee.io/new link to get a free instant HTTPS URL, then paste it into the Webhook URL field.');
+        e.preventDefault();
+        return;
+      }
+
+      const manifest = {
+        name: name,
+        url: "https://github.com/org/merklegate",
+        redirect_url: window.location.origin + "/setup/github/callback",
+        hook_attributes: {
+          url: hookUrl,
+          active: true
+        },
+        description: "Enterprise streaming verifiable compliance ledger for Git commits, PR approvals, and security scans.",
+        public: true,
+        default_permissions: {
+          contents: "read",
+          pull_requests: "read",
+          actions: "read",
+          checks: "read"
+        },
+        default_events: [
+          "push",
+          "pull_request",
+          "pull_request_review",
+          "workflow_run",
+          "check_run"
+        ]
+      };
+
+      document.getElementById('manifestPayload').value = JSON.stringify(manifest);
+    });
+  </script>
+</body>
+</html>`)
+	})
+
+	mux.HandleFunc("/setup/github/callback", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			http.Error(w, "missing code parameter from GitHub", http.StatusBadRequest)
+			return
+		}
+
+		convertURL := fmt.Sprintf("https://api.github.com/app-manifests/%s/conversions", code)
+		convReq, err := http.NewRequest(http.MethodPost, convertURL, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		convReq.Header.Set("Accept", "application/vnd.github+json")
+		convReq.Header.Set("User-Agent", "MerkleGate-Ledger")
+
+		resp, err := http.DefaultClient.Do(convReq)
+		if err != nil {
+			http.Error(w, "Failed to connect to GitHub API: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		var appData struct {
+			ID      int64  `json:"id"`
+			Slug    string `json:"slug"`
+			HTMLURL string `json:"html_url"`
+			Name    string `json:"name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&appData); err != nil {
+			http.Error(w, "Failed to parse GitHub conversion response: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new", appData.Slug)
+		if appData.HTMLURL != "" {
+			installURL = fmt.Sprintf("%s/installations/new", appData.HTMLURL)
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+  <title>GitHub App Created!</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 36px; max-width: 550px; text-align: center; }
+    h1 { color: #3fb950; font-size: 24px; margin-top: 0; }
+    p { color: #8b949e; line-height: 1.6; }
+    .btn { display: inline-block; background: #238636; color: white; text-decoration: none; padding: 12px 24px; font-size: 15px; font-weight: 600; border-radius: 6px; margin-top: 20px; }
+    .btn:hover { background: #2ea043; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎉 GitHub App Registered!</h1>
+    <p>Your app <strong>%s</strong> (ID: %d) has been permanently created on GitHub.</p>
+    <p>Now install it on your repositories to begin streaming compliance events into MerkleGate.</p>
+    <a href="%s" class="btn">🚀 Install App on My Repositories</a>
+  </div>
+</body>
+</html>`, appData.Name, appData.ID, installURL)
 	})
 
 	server := &http.Server{
