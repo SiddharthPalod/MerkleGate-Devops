@@ -5,7 +5,7 @@
 [![Cryptography](https://img.shields.io/badge/Signature-Ed25519%20STH-success.svg)](https://ed25519.cr.yp.to/)
 [![Storage Spec](https://img.shields.io/badge/Storage-C2SP%20Static%20Tiles-orange.svg)](https://c2sp.org/static-merkle-tree-tiles)
 [![CI/CD](https://img.shields.io/badge/GitHub%20Actions-Guardrail%20Verified-blueviolet.svg)](https://github.com/SiddharthPalod/MerkleGate-Devops/actions)
-[![License](https://img.shields.io/badge/License-Apache%202.0-black.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-black.svg)](#license)
 
 **MerkleGate** is a high-throughput, domain-separated streaming verifiable compliance ledger purpose-built for DevOps pipelines and software supply chain integrity (SLSA Level 3+). 
 
@@ -356,6 +356,6 @@ node --test action/verify.test.js action/index.test.js
 
 ---
 
-## 📄 License
+## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Released under the Apache 2.0 terms. Copyright (c) 2026 Siddharth Palod.
