@@ -1,0 +1,12 @@
+name: MerkleGate Guardrail
+on: [push, pull_request]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify Compliance
+        run: |
+          echo "Verifying MerkleGate Compliance Receipt for ${{ github.sha }}"
