@@ -481,6 +481,44 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleEventsCommit(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	commitSHA := strings.TrimPrefix(r.URL.Path, "/api/v1/events/commit/")
+	var indices []int
+	indexMap := make(map[int]bool)
+
+	if s.redisIdx != nil {
+		if cIndices, err := s.redisIdx.FindByCommit(r.Context(), commitSHA); err == nil {
+			for _, idx := range cIndices {
+				if idx >= 0 && idx < len(s.events) {
+					indexMap[idx] = true
+				}
+			}
+		}
+	}
+
+	// Fallback to in-memory event scan
+	lowerSHA := strings.ToLower(commitSHA)
+	for i, ev := range s.events {
+		if strings.Contains(strings.ToLower(string(ev)), lowerSHA) {
+			indexMap[i] = true
+		}
+	}
+
+	for idx := range indexMap {
+		indices = append(indices, idx)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"commit_sha":   commitSHA,
+		"leaf_indices": indices,
+		"count":        len(indices),
+	})
+}
+
 func (s *Server) handleGetReceipt(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -723,6 +761,7 @@ func main() {
 	http.HandleFunc("/api/proof/inclusion", server.handleInclusionProof)
 	http.HandleFunc("/api/proof/consistency", server.handleConsistencyProof)
 	http.HandleFunc("/api/search", server.handleSearch)
+	http.HandleFunc("/api/v1/events/commit/", server.handleEventsCommit)
 	http.HandleFunc("/api/v1/receipt/", server.handleGetReceipt)
 	http.HandleFunc("/api/v1/receipt/verify", server.handleVerifyReceipt)
 
