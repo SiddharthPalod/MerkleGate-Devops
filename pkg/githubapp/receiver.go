@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -437,17 +438,19 @@ func (recv *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var instWrapper struct {
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	_ = json.Unmarshal(bodyBytes, &instWrapper)
+	instID := instWrapper.Installation.ID
+	repoName, _ := event.Details["repo"].(string)
+
+	log.Printf("[Webhook Ingest] Received event %s for %s (%s) instID=%d", event.EventType, event.CommitSHA, repoName, instID)
+
 	// Post GitHub Check Run asynchronously if client is configured and installation ID is present
 	if recv.cfg.Client != nil && event.CommitSHA != "" {
-		var instWrapper struct {
-			Installation struct {
-				ID int64 `json:"id"`
-			} `json:"installation"`
-		}
-		_ = json.Unmarshal(bodyBytes, &instWrapper)
-		instID := instWrapper.Installation.ID
-
-		repoName, _ := event.Details["repo"].(string)
 		if instID > 0 && repoName != "" {
 			go func(id int64, repo, sha, evtType, actor string) {
 				ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
@@ -468,14 +471,21 @@ func (recv *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						sha, sha, actor, evtType),
 				}
 
-				_ = recv.cfg.Client.CreateCheckRun(ctx, id, repo, CheckRunInput{
+				err := recv.cfg.Client.CreateCheckRun(ctx, id, repo, CheckRunInput{
 					Name:       "MerkleGate / Compliance Ledger",
 					HeadSHA:    sha,
 					Status:     "completed",
 					Conclusion: "success",
 					Output:     output,
 				})
+				if err != nil {
+					log.Printf("[GitHub Check Run] Failed to post check run to %s @ %s: %v", repo, sha, err)
+				} else {
+					log.Printf("[GitHub Check Run] Successfully created Check Run on %s @ %s", repo, sha)
+				}
 			}(instID, repoName, event.CommitSHA, event.EventType, event.Actor)
+		} else {
+			log.Printf("[GitHub Check Run] Skipped: instID=%d, repoName=%s", instID, repoName)
 		}
 	}
 

@@ -109,8 +109,8 @@ func (c *Client) GenerateAppJWT() (string, error) {
 
 	now := time.Now().Unix()
 	claims := map[string]interface{}{
-		"iat": now - 60,       // 60 seconds clock skew tolerance
-		"exp": now + 600,      // 10 minutes max expiration
+		"iat": now - 60,  // 60 seconds clock skew tolerance
+		"exp": now + 500, // Total lifetime 560s (< 10 minutes max allowed from iat by GitHub)
 		"iss": c.appID,
 	}
 
