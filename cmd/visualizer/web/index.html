@@ -22,6 +22,13 @@
         <p class="text-slate-400 text-xs mt-0.5">Streaming RFC 6962 Verifiable Compliance Ledger • Phase 4 CI/CD Guardrails & GitHub App Active</p>
       </div>
       <div class="flex items-center gap-2">
+        <!-- Multi-Tenant Repository Selector -->
+        <div class="flex items-center gap-1.5 bg-slate-900 border border-slate-700 px-2.5 py-1 rounded">
+          <span class="text-slate-400 font-semibold text-[11px]">📁 Repo:</span>
+          <select id="repoSelect" class="bg-slate-950 text-indigo-300 font-mono text-xs border-0 outline-none cursor-pointer">
+            <option value="demo/default">demo/default</option>
+          </select>
+        </div>
         <a href="/setup/github" target="_blank" class="px-2.5 py-1 rounded bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/50 text-indigo-300 font-medium transition flex items-center gap-1.5 text-xs">
           <span>🚀</span> 1-Click GitHub App
         </a>
@@ -231,6 +238,7 @@
 
   <script>
     let currentTreeData = null;
+    let currentRepo = 'demo/default';
     let selectedMode = 'tree';
     let targetLeafIndex = 0;
     let oldTreeSize = 2;
@@ -239,9 +247,28 @@
     let searchHighlightedHashes = [];
     let isFormMode = true;
 
+    async function loadRepos() {
+      try {
+        const res = await fetch('/api/v1/repos');
+        const data = await res.json();
+        const select = document.getElementById('repoSelect');
+        if (select && data.repos) {
+          select.innerHTML = '';
+          data.repos.forEach(r => {
+            const opt = document.createElement('option');
+            opt.value = r;
+            opt.textContent = r;
+            if (r === data.active) opt.selected = true;
+            select.appendChild(opt);
+          });
+          currentRepo = data.active || data.repos[0] || 'demo/default';
+        }
+      } catch (e) {}
+    }
+
     // --- API Service Calls to Go Server ---
     async function fetchTree() {
-      const res = await fetch('/api/tree');
+      const res = await fetch(`/api/tree?repo=${encodeURIComponent(currentRepo)}`);
       currentTreeData = await res.json();
       updateUI();
     }
@@ -250,7 +277,7 @@
       const res = await fetch('/api/events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: text })
+        body: JSON.stringify({ event: text, repo: currentRepo })
       });
       const data = await res.json();
       if (data.status === 'duplicate_dropped') {
@@ -266,7 +293,7 @@
     }
 
     async function resetEngine() {
-      const res = await fetch('/api/reset', { method: 'POST' });
+      const res = await fetch(`/api/reset?repo=${encodeURIComponent(currentRepo)}`, { method: 'POST' });
       currentTreeData = await res.json();
       targetLeafIndex = 0;
       searchHighlightedIndices = [];
@@ -277,18 +304,18 @@
     }
 
     async function tamperEngine() {
-      const res = await fetch('/api/tamper', { method: 'POST' });
+      const res = await fetch(`/api/tamper?repo=${encodeURIComponent(currentRepo)}`, { method: 'POST' });
       currentTreeData = await res.json();
       updateUI();
     }
 
     async function fetchInclusionProof(idx) {
-      const res = await fetch(`/api/proof/inclusion?leafIndex=${idx}`);
+      const res = await fetch(`/api/proof/inclusion?leafIndex=${idx}&repo=${encodeURIComponent(currentRepo)}`);
       return await res.json();
     }
 
     async function fetchConsistencyProof(m) {
-      const res = await fetch(`/api/proof/consistency?oldSize=${m}`);
+      const res = await fetch(`/api/proof/consistency?oldSize=${m}&repo=${encodeURIComponent(currentRepo)}`);
       return await res.json();
     }
 
@@ -301,7 +328,7 @@
         return;
       }
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&repo=${encodeURIComponent(currentRepo)}`);
         const data = await res.json();
         searchHighlightedIndices = data.indices || [];
         searchHighlightedHashes = (data.matchedHashes || []).map(h => h.toLowerCase());
@@ -739,7 +766,12 @@
 
     // Export Compliance Receipt download
     document.getElementById('btnExportReceipt').addEventListener('click', () => {
-      window.open(`/api/v1/receipt/${targetLeafIndex}`, '_blank');
+      window.open(`/api/v1/receipt/${targetLeafIndex}?repo=${encodeURIComponent(currentRepo)}`, '_blank');
+    });
+
+    document.getElementById('repoSelect').addEventListener('change', (e) => {
+      currentRepo = e.target.value;
+      fetchTree();
     });
 
     // Click on node hash to copy to search box
@@ -752,7 +784,10 @@
     });
 
     // Initial load from Go server
-    fetchTree();
+    (async () => {
+      await loadRepos();
+      fetchTree();
+    })();
   </script>
 </body>
 </html>

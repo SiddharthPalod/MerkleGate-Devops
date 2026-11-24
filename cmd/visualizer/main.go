@@ -30,21 +30,113 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+type RepoLedger struct {
+	mu                sync.RWMutex
+	repoName          string
+	events            [][]byte
+	originalData      [][]byte
+	isTampered        bool
+	tree              *merkle.Tree
+	latestSTH         *signer.SignedTreeHead
+	sequence          uint64
+	bloom             *dedup.BloomFilter
+	droppedDuplicates int
+	tileStore         *storage.TileStore
+	storageDir        string
+}
+
+func newRepoLedger(name, baseDir string, hasher merkle.Hasher, sig *signer.LocalSigner) *RepoLedger {
+	safeName := strings.ReplaceAll(name, "/", "_")
+	safeName = strings.ReplaceAll(safeName, "\\", "_")
+	repoDir := filepath.Join(baseDir, "repos", safeName)
+	_ = os.MkdirAll(repoDir, 0755)
+
+	driver, _ := storage.NewFileStorageDriver(filepath.Join(repoDir, "tiles"))
+	store := storage.NewTileStore(driver)
+	bf, _ := dedup.New(1000, 0.001)
+
+	rl := &RepoLedger{
+		repoName:   name,
+		bloom:      bf,
+		tileStore:  store,
+		storageDir: repoDir,
+	}
+
+	if name == "demo/default" {
+		rl.events = [][]byte{
+			[]byte(`{"event_type":"git_commit","commit_sha":"a7f43b1","actor":"alice"}`),
+			[]byte(`{"event_type":"snyk_scan","commit_sha":"a7f43b1","actor":"snyk-bot"}`),
+			[]byte(`{"event_type":"pr_approval","pr_number":42,"actor":"bob"}`),
+			[]byte(`{"event_type":"argocd_sync","commit_sha":"a7f43b1","actor":"argocd"}`),
+		}
+		rl.originalData = make([][]byte, len(rl.events))
+		for i, ev := range rl.events {
+			rl.originalData[i] = append([]byte(nil), ev...)
+		}
+	}
+
+	rl.rebuildTree(hasher, sig, nil)
+	return rl
+}
+
+func (rl *RepoLedger) rebuildTree(hasher merkle.Hasher, sig *signer.LocalSigner, redisIdx indexer.Indexer) {
+	if len(rl.events) == 0 {
+		return
+	}
+	tree, err := merkle.NewTree(rl.events, hasher)
+	if err != nil {
+		log.Printf("error building tree for %s: %v", rl.repoName, err)
+		return
+	}
+	rl.tree = tree
+
+	// Persist C2SP tiles
+	leafHashes := make([][]byte, len(rl.events))
+	for i, e := range rl.events {
+		leafHashes[i] = hasher.HashLeaf(e)
+		rl.bloom.Add(leafHashes[i])
+	}
+	_ = rl.tileStore.SaveLeaves(0, leafHashes, rl.events)
+
+	// Index in Redis with repo prefix
+	if redisIdx != nil {
+		ctx := context.Background()
+		for i, e := range rl.events {
+			meta := parseEventMeta(i, leafHashes[i], e)
+			_ = redisIdx.IndexEvent(ctx, meta)
+		}
+	}
+
+	// Sign STH
+	if !rl.isTampered && rl.tree.Root != nil && sig != nil {
+		rl.sequence++
+		sth, err := sig.SignTreeHead(len(rl.events), rl.tree.Root.Hash, rl.sequence)
+		if err == nil {
+			rl.latestSTH = sth
+		}
+	}
+}
+
 type Server struct {
-	mu                 sync.Mutex
-	hasher             merkle.Hasher
-	events             [][]byte
-	originalData       [][]byte
-	isTampered         bool
-	tree               *merkle.Tree
-	signer             *signer.LocalSigner
-	latestSTH          *signer.SignedTreeHead
-	sequence           uint64
-	bloom              *dedup.BloomFilter
-	droppedDuplicates  int
-	tileStore          *storage.TileStore
-	storageDir         string
-	redisIdx           indexer.Indexer
+	mu             sync.Mutex
+	hasher         merkle.Hasher
+	signer         *signer.LocalSigner
+	baseStorageDir string
+	redisIdx       indexer.Indexer
+	repos          map[string]*RepoLedger
+	activeRepo     string
+}
+
+func (s *Server) getRepo(name string) *RepoLedger {
+	if name == "" {
+		name = s.activeRepo
+	}
+	if rl, ok := s.repos[name]; ok {
+		return rl
+	}
+	rl := newRepoLedger(name, s.baseStorageDir, s.hasher, s.signer)
+	s.repos[name] = rl
+	return rl
 }
 
 func NewServer() *Server {
@@ -73,9 +165,6 @@ func NewServer() *Server {
 		}
 	}
 
-	driver, _ := storage.NewFileStorageDriver(storageDir)
-	store := storage.NewTileStore(driver)
-
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
@@ -89,70 +178,40 @@ func NewServer() *Server {
 	}
 	pingCancel()
 
+	hasher := merkle.NewSHA256Hasher()
 	s := &Server{
-		hasher:     merkle.NewSHA256Hasher(),
-		signer:     sig,
-		tileStore:  store,
-		storageDir: storageDir,
-		redisIdx:   redisIdx,
+		hasher:         hasher,
+		signer:         sig,
+		baseStorageDir: storageDir,
+		redisIdx:       redisIdx,
+		repos:          make(map[string]*RepoLedger),
+		activeRepo:     "demo/default",
 	}
-	s.reset()
+
+	s.repos["demo/default"] = newRepoLedger("demo/default", storageDir, hasher, sig)
 	return s
 }
 
-func (s *Server) reset() {
-	s.events = [][]byte{
-		[]byte(`{"event_type":"git_commit","commit_sha":"a7f43b1","actor":"alice"}`),
-		[]byte(`{"event_type":"snyk_scan","commit_sha":"a7f43b1","actor":"snyk-bot"}`),
-		[]byte(`{"event_type":"pr_approval","pr_number":42,"actor":"bob"}`),
-		[]byte(`{"event_type":"argocd_sync","commit_sha":"a7f43b1","actor":"argocd"}`),
-	}
-	s.originalData = make([][]byte, len(s.events))
-	for i, ev := range s.events {
-		s.originalData[i] = append([]byte(nil), ev...)
-	}
-	s.isTampered = false
-	s.droppedDuplicates = 0
-	s.sequence = 0
-
-	s.bloom, _ = dedup.New(1000, 0.001)
-
-	s.rebuildTree()
-}
-
-func (s *Server) rebuildTree() {
-	tree, err := merkle.NewTree(s.events, s.hasher)
-	if err != nil {
-		log.Printf("error building tree: %v", err)
-		return
-	}
-	s.tree = tree
-
-	// Persist C2SP tiles
-	leafHashes := make([][]byte, len(s.events))
-	for i, e := range s.events {
-		leafHashes[i] = s.hasher.HashLeaf(e)
-		s.bloom.Add(leafHashes[i])
-	}
-	_ = s.tileStore.SaveLeaves(0, leafHashes, s.events)
-
-	// Index in Redis
-	if s.redisIdx != nil {
-		ctx := context.Background()
-		for i, e := range s.events {
-			meta := parseEventMeta(i, leafHashes[i], e)
-			_ = s.redisIdx.IndexEvent(ctx, meta)
+func (rl *RepoLedger) reset(hasher merkle.Hasher, sig *signer.LocalSigner) {
+	if rl.repoName == "demo/default" {
+		rl.events = [][]byte{
+			[]byte(`{"event_type":"git_commit","commit_sha":"a7f43b1","actor":"alice"}`),
+			[]byte(`{"event_type":"snyk_scan","commit_sha":"a7f43b1","actor":"snyk-bot"}`),
+			[]byte(`{"event_type":"pr_approval","pr_number":42,"actor":"bob"}`),
+			[]byte(`{"event_type":"argocd_sync","commit_sha":"a7f43b1","actor":"argocd"}`),
 		}
+	} else {
+		rl.events = nil
 	}
-
-	// Sign STH
-	if !s.isTampered && s.tree.Root != nil {
-		s.sequence++
-		sth, err := s.signer.SignTreeHead(len(s.events), s.tree.Root.Hash, s.sequence)
-		if err == nil {
-			s.latestSTH = sth
-		}
+	rl.originalData = make([][]byte, len(rl.events))
+	for i, ev := range rl.events {
+		rl.originalData[i] = append([]byte(nil), ev...)
 	}
+	rl.isTampered = false
+	rl.droppedDuplicates = 0
+	rl.sequence = 0
+	rl.bloom, _ = dedup.New(1000, 0.001)
+	rl.rebuildTree(hasher, sig, nil)
 }
 
 func parseEventMeta(index int, hash []byte, raw []byte) indexer.EventMetadata {
@@ -218,17 +277,22 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
 	var rootDTO *NodeDTO
-	if s.tree != nil && s.tree.Root != nil {
-		rootDTO = serializeNode(s.tree.Root, s.tree.Leaves, s.events)
+	var rootHash string
+	if rl.tree != nil && rl.tree.Root != nil {
+		rootDTO = serializeNode(rl.tree.Root, rl.tree.Leaves, rl.events)
+		rootHash = hex.EncodeToString(rl.tree.Root.Hash)
 	}
 
 	sthValid := false
-	if s.latestSTH != nil {
-		sthValid = s.signer.VerifyTreeHead(s.latestSTH) && !s.isTampered
+	if rl.latestSTH != nil {
+		sthValid = s.signer.VerifyTreeHead(rl.latestSTH) && !rl.isTampered
 	}
 
-	total := len(s.events)
+	total := len(rl.events)
 	tileIdx := total / storage.TileWidth
 	partialWidth := total % storage.TileWidth
 	chunkIdx := tileIdx
@@ -241,19 +305,20 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 	latestChunk := storage.ChunkPath(chunkIdx)
 
 	resp := map[string]interface{}{
+		"repo":              rl.repoName,
 		"size":              total,
-		"isTampered":        s.isTampered,
-		"rootHash":          hex.EncodeToString(s.tree.Root.Hash),
+		"isTampered":        rl.isTampered,
+		"rootHash":          rootHash,
 		"root":              rootDTO,
-		"droppedDuplicates": s.droppedDuplicates,
-		"sth":               s.latestSTH,
+		"droppedDuplicates": rl.droppedDuplicates,
+		"sth":               rl.latestSTH,
 		"sthValid":          sthValid,
 		"redisOnline":       s.redisIdx != nil,
 		"c2spTile":          latestTile,
 		"c2spChunk":         latestChunk,
 		"events": func() []string {
 			var list []string
-			for _, e := range s.events {
+			for _, e := range rl.events {
 				list = append(list, string(e))
 			}
 			return list
@@ -272,6 +337,7 @@ func (s *Server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Event string `json:"event"`
+		Repo  string `json:"repo"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Event == "" {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -279,25 +345,29 @@ func (s *Server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if req.Repo != "" {
+		s.activeRepo = req.Repo
+	}
+	rl := s.getRepo(req.Repo)
 	data := []byte(req.Event)
 	leafHash := s.hasher.HashLeaf(data)
 
 	// Ingestion Bloom Filter check
-	if s.bloom.Contains(leafHash) {
-		s.droppedDuplicates++
+	if rl.bloom.Contains(leafHash) {
+		rl.droppedDuplicates++
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "duplicate_dropped",
 			"message":           "Duplicate event intercepted and dropped by Bloom filter",
-			"droppedDuplicates": s.droppedDuplicates,
+			"droppedDuplicates": rl.droppedDuplicates,
 		})
 		return
 	}
 
-	s.events = append(s.events, data)
-	s.originalData = append(s.originalData, data)
-	s.rebuildTree()
+	rl.events = append(rl.events, data)
+	rl.originalData = append(rl.originalData, data)
+	rl.rebuildTree(s.hasher, s.signer, s.redisIdx)
 	s.mu.Unlock()
 
 	s.handleGetTree(w, r)
@@ -305,7 +375,9 @@ func (s *Server) handleAddEvent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	s.reset()
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+	rl.reset(s.hasher, s.signer)
 	s.mu.Unlock()
 
 	s.handleGetTree(w, r)
@@ -313,12 +385,13 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTamper(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	if len(s.events) > 0 {
-		s.events[0] = []byte(string(s.originalData[0]) + " [TAMPERED_BY_ATTACKER]")
-		s.isTampered = true
-		// Rebuild tree without resigning STH - STH signature will not match tampered root!
-		tree, _ := merkle.NewTree(s.events, s.hasher)
-		s.tree = tree
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+	if len(rl.events) > 0 {
+		rl.events[0] = []byte(string(rl.originalData[0]) + " [TAMPERED_BY_ATTACKER]")
+		rl.isTampered = true
+		tree, _ := merkle.NewTree(rl.events, s.hasher)
+		rl.tree = tree
 	}
 	s.mu.Unlock()
 
@@ -329,21 +402,24 @@ func (s *Server) handleInclusionProof(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
 	idxStr := r.URL.Query().Get("leafIndex")
 	leafIdx, err := strconv.Atoi(idxStr)
-	if err != nil || leafIdx < 0 || leafIdx >= len(s.events) {
+	if err != nil || leafIdx < 0 || leafIdx >= len(rl.events) {
 		http.Error(w, "invalid leafIndex", http.StatusBadRequest)
 		return
 	}
 
-	proof, err := s.tree.GenerateInclusionProof(leafIdx)
+	proof, err := rl.tree.GenerateInclusionProof(leafIdx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	leafHash := s.hasher.HashLeaf(s.events[leafIdx])
-	verified := merkle.VerifyInclusion(s.hasher, leafHash, s.tree.Root.Hash, proof)
+	leafHash := s.hasher.HashLeaf(rl.events[leafIdx])
+	verified := merkle.VerifyInclusion(s.hasher, leafHash, rl.tree.Root.Hash, proof)
 
 	var pathHex []string
 	for _, p := range proof.AuditPath {
@@ -355,9 +431,9 @@ func (s *Server) handleInclusionProof(w http.ResponseWriter, r *http.Request) {
 		"treeSize":   proof.TreeSize,
 		"auditPath":  pathHex,
 		"leafHash":   hex.EncodeToString(leafHash),
-		"rootHash":   hex.EncodeToString(s.tree.Root.Hash),
-		"verified":   verified && !s.isTampered,
-		"isTampered": s.isTampered,
+		"rootHash":   hex.EncodeToString(rl.tree.Root.Hash),
+		"verified":   verified && !rl.isTampered,
+		"isTampered": rl.isTampered,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -368,26 +444,29 @@ func (s *Server) handleConsistencyProof(w http.ResponseWriter, r *http.Request) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
 	mStr := r.URL.Query().Get("oldSize")
 	m, err := strconv.Atoi(mStr)
-	if err != nil || m <= 0 || m > len(s.events) {
+	if err != nil || m <= 0 || m > len(rl.events) {
 		http.Error(w, "invalid oldSize", http.StatusBadRequest)
 		return
 	}
 
-	oldTree, err := merkle.NewTree(s.originalData[:m], s.hasher)
+	oldTree, err := merkle.NewTree(rl.originalData[:m], s.hasher)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	proof, err := s.tree.GenerateConsistencyProof(m)
+	proof, err := rl.tree.GenerateConsistencyProof(m)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	verified := merkle.VerifyConsistency(s.hasher, oldTree.Root.Hash, s.tree.Root.Hash, proof)
+	verified := merkle.VerifyConsistency(s.hasher, oldTree.Root.Hash, rl.tree.Root.Hash, proof)
 
 	var pathHex []string
 	for _, p := range proof.Path {
@@ -396,12 +475,12 @@ func (s *Server) handleConsistencyProof(w http.ResponseWriter, r *http.Request) 
 
 	resp := map[string]interface{}{
 		"oldSize":    m,
-		"newSize":    len(s.events),
+		"newSize":    len(rl.events),
 		"oldRoot":    hex.EncodeToString(oldTree.Root.Hash),
-		"newRoot":    hex.EncodeToString(s.tree.Root.Hash),
+		"newRoot":    hex.EncodeToString(rl.tree.Root.Hash),
 		"path":       pathHex,
-		"verified":   verified && !s.isTampered,
-		"isTampered": s.isTampered,
+		"verified":   verified && !rl.isTampered,
+		"isTampered": rl.isTampered,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -411,6 +490,9 @@ func (s *Server) handleConsistencyProof(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
 
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
@@ -430,18 +512,24 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if s.redisIdx != nil {
 		if cIndices, err := s.redisIdx.FindByCommit(r.Context(), query); err == nil {
 			for _, idx := range cIndices {
-				indexMap[idx] = true
+				if idx >= 0 && idx < len(rl.events) {
+					indexMap[idx] = true
+				}
 			}
 		}
 		if aIndices, err := s.redisIdx.FindByActor(r.Context(), query); err == nil {
 			for _, idx := range aIndices {
-				indexMap[idx] = true
+				if idx >= 0 && idx < len(rl.events) {
+					indexMap[idx] = true
+				}
 			}
 		}
 		if num, err := strconv.Atoi(query); err == nil {
 			if prIndices, err := s.redisIdx.FindByPR(r.Context(), num); err == nil {
 				for _, idx := range prIndices {
-					indexMap[idx] = true
+					if idx >= 0 && idx < len(rl.events) {
+						indexMap[idx] = true
+					}
 				}
 			}
 		}
@@ -449,7 +537,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Check SHA-256 Digests (Root, Internal Nodes, Leaves)
 	lowerQ := strings.ToLower(query)
-	for i, e := range s.events {
+	for i, e := range rl.events {
 		leafHashHex := strings.ToLower(hex.EncodeToString(s.hasher.HashLeaf(e)))
 		if strings.HasPrefix(leafHashHex, lowerQ) || strings.Contains(leafHashHex, lowerQ) {
 			indexMap[i] = true
@@ -460,8 +548,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if s.tree != nil && s.tree.Root != nil {
-		rootHashHex := strings.ToLower(hex.EncodeToString(s.tree.Root.Hash))
+	if rl.tree != nil && rl.tree.Root != nil {
+		rootHashHex := strings.ToLower(hex.EncodeToString(rl.tree.Root.Hash))
 		if strings.HasPrefix(rootHashHex, lowerQ) || strings.Contains(rootHashHex, lowerQ) {
 			matchedHashes = append(matchedHashes, rootHashHex)
 		}
@@ -485,6 +573,9 @@ func (s *Server) handleEventsCommit(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
 	commitSHA := strings.TrimPrefix(r.URL.Path, "/api/v1/events/commit/")
 	var indices []int
 	indexMap := make(map[int]bool)
@@ -492,7 +583,7 @@ func (s *Server) handleEventsCommit(w http.ResponseWriter, r *http.Request) {
 	if s.redisIdx != nil {
 		if cIndices, err := s.redisIdx.FindByCommit(r.Context(), commitSHA); err == nil {
 			for _, idx := range cIndices {
-				if idx >= 0 && idx < len(s.events) {
+				if idx >= 0 && idx < len(rl.events) {
 					indexMap[idx] = true
 				}
 			}
@@ -501,7 +592,7 @@ func (s *Server) handleEventsCommit(w http.ResponseWriter, r *http.Request) {
 
 	// Fallback to in-memory event scan
 	lowerSHA := strings.ToLower(commitSHA)
-	for i, ev := range s.events {
+	for i, ev := range rl.events {
 		if strings.Contains(strings.ToLower(string(ev)), lowerSHA) {
 			indexMap[i] = true
 		}
@@ -523,23 +614,26 @@ func (s *Server) handleGetReceipt(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
 	idxStr := r.URL.Query().Get("leafIndex")
 	if idxStr == "" {
 		idxStr = strings.TrimPrefix(r.URL.Path, "/api/v1/receipt/")
 	}
 	leafIdx, err := strconv.Atoi(idxStr)
-	if err != nil || leafIdx < 0 || leafIdx >= len(s.events) {
+	if err != nil || leafIdx < 0 || leafIdx >= len(rl.events) {
 		http.Error(w, "invalid leafIndex", http.StatusBadRequest)
 		return
 	}
 
-	inclProof, err := s.tree.GenerateInclusionProof(leafIdx)
+	inclProof, err := rl.tree.GenerateInclusionProof(leafIdx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	rcpt, err := receipt.BuildReceipt(leafIdx, s.events[leafIdx], inclProof, nil, nil, s.latestSTH)
+	rcpt, err := receipt.BuildReceipt(leafIdx, rl.events[leafIdx], inclProof, nil, nil, rl.latestSTH)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -548,6 +642,36 @@ func (s *Server) handleGetReceipt(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=receipt-leaf-%d.json", leafIdx))
 	json.NewEncoder(w).Encode(rcpt)
+}
+
+func (s *Server) handleListRepos(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var list []string
+	for name := range s.repos {
+		list = append(list, name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"repos":  list,
+		"active": s.activeRepo,
+	})
+}
+
+func (s *Server) handleGetSTH(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	repoName := r.URL.Query().Get("repo")
+	rl := s.getRepo(repoName)
+
+	if rl.latestSTH == nil {
+		http.Error(w, "no STH available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rl.latestSTH)
 }
 
 func (s *Server) handleVerifyReceipt(w http.ResponseWriter, r *http.Request) {
@@ -576,16 +700,35 @@ func (vp *visualizerProducer) Publish(ctx context.Context, key string, event []b
 	vp.s.mu.Lock()
 	defer vp.s.mu.Unlock()
 
+	var raw struct {
+		Details map[string]interface{} `json:"details"`
+		Repo    string                 `json:"repo"`
+	}
+	_ = json.Unmarshal(event, &raw)
+	repoName := raw.Repo
+	if repoName == "" && raw.Details != nil {
+		if r, ok := raw.Details["repo"].(string); ok {
+			repoName = r
+		}
+	}
+	if repoName == "" {
+		repoName = vp.s.activeRepo
+	}
+
+	rl := vp.s.getRepo(repoName)
+	vp.s.activeRepo = repoName
+
 	leafHash := vp.s.hasher.HashLeaf(event)
-	if vp.s.bloom.Contains(leafHash) {
-		vp.s.droppedDuplicates++
+	if rl.bloom.Contains(leafHash) {
+		rl.droppedDuplicates++
 		return nil
 	}
-	vp.s.bloom.Add(leafHash)
+	rl.bloom.Add(leafHash)
 
-	vp.s.events = append(vp.s.events, event)
-	vp.s.originalData = append(vp.s.originalData, event)
-	vp.s.rebuildTree()
+	rl.events = append(rl.events, event)
+	rl.originalData = append(rl.originalData, event)
+	rl.rebuildTree(vp.s.hasher, vp.s.signer, vp.s.redisIdx)
+	log.Printf("[Multi-Tenant Ledger] Ingested event into isolated tree for repo: %s (Total Leaves: %d)", repoName, len(rl.events))
 	return nil
 }
 
@@ -857,6 +1000,8 @@ func main() {
 	http.HandleFunc("/api/proof/consistency", server.handleConsistencyProof)
 	http.HandleFunc("/api/search", server.handleSearch)
 	http.HandleFunc("/api/v1/events/commit/", server.handleEventsCommit)
+	http.HandleFunc("/api/v1/repos", server.handleListRepos)
+	http.HandleFunc("/api/v1/sth", server.handleGetSTH)
 	http.HandleFunc("/api/v1/receipt/", server.handleGetReceipt)
 	http.HandleFunc("/api/v1/receipt/verify", server.handleVerifyReceipt)
 

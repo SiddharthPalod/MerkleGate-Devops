@@ -356,6 +356,50 @@ node --test action/verify.test.js action/index.test.js
 
 ---
 
+## ❓ Frequently Asked Questions (FAQ)
+
+### 1. Where is the Merkle tree stored?
+MerkleGate uses a decoupled two-tier storage topology:
+* **Cold Immutable Store (C2SP Tiles):** Stored on disk under `data/tiles/{owner}/{repo}/`. Each file adheres to the C2SP static Merkle tile standard (flat 8KB binary files with 256 SHA-256 hashes). Once sealed, tiles are set to read-only (`chmod 0444`) to emulate hardware WORM.
+* **Hot Search Index (Redis 7):** In-memory inverted indices mapping commit SHAs, PR numbers, and actors to leaf indices (`idx:commit:<sha>`).
+* **Checkpoints (Ed25519 STH):** Stored in `data/keys/` containing canonical Signed Tree Heads and public keys.
+
+### 2. Does MerkleGate see or store proprietary source code?
+**No. Zero lines of code, file diffs, or secrets are ever accessed or stored.**
+MerkleGate only receives standardized GitHub webhook metadata:
+```json
+{
+  "event_type": "git_commit",
+  "commit_sha": "ea85f58cf51d...",
+  "actor": "alice",
+  "repo": "org/repo",
+  "timestamp": 1732441200
+}
+```
+Commit SHAs, PR numbers, and reviewer handles are public Git identifiers. MerkleGate never requests repository code reading permissions.
+
+### 3. How does Zero-Knowledge / Blinded Leaf Compliance work?
+A binary Merkle tree operates purely on 32-byte SHA-256 hashes:
+$$\text{Leaf Hash} = \text{SHA-256}(0x00 \mathbin{\Vert} \text{payload})$$
+Organizations requiring absolute privacy can compute a blinded leaf hash locally:
+$$\text{Blinded Leaf} = \text{HMAC}(\text{OrgSecret}, \text{CommitSHA})$$
+MerkleGate logs and verifies the mathematical inclusion proof for the 32-byte digest without ever having access to the underlying secret or event preimage.
+
+### 4. Are different repositories isolated, or do they share one Merkle tree?
+**Every repository has its own isolated Merkle tree.**
+* Multi-tenant storage partitioning separates trees by `owner/repo`: `data/tiles/{owner}/{repo}/`.
+* Each repository produces its own independent Ed25519 Signed Tree Heads (STH) with its own sequence counter and tree size.
+* Proving compliance for Repository A is mathematically and cryptographically decoupled from Repository B.
+
+### 5. Why use the GitHub App instead of GitHub Actions?
+* **GitHub App (Zero Config):** Repository owners click "Install" once. Every commit and PR automatically receives a native compliance check without adding or maintaining `.github/workflows/` files across hundreds of repositories.
+* **GitHub Action (In-Pipeline Gate):** Available in `action/` for teams that want client-side verification directly inside their deployment jobs (e.g. blocking `kubectl apply` or `docker push` if an audit receipt fails).
+
+### 6. Can enterprises self-host MerkleGate for air-gapped compliance?
+**Yes.** MerkleGate is 100% self-contained. Regulated organizations (FedRAMP, SOC 2, HIPAA, PCI DSS) can deploy the Docker Compose stack inside their private VPC or on-premises Kubernetes clusters, ensuring all audit data remains strictly within their corporate security boundary.
+
+---
+
 ## License
 
 Released under the Apache 2.0 terms. Copyright (c) 2026 Siddharth Palod.
