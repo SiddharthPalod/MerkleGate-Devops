@@ -12,7 +12,8 @@
     "contents": "read",
     "pull_requests": "read",
     "actions": "read",
-    "checks": "read"
+    "checks": "write",
+    "statuses": "write"
   },
   "default_events": [
     "push",

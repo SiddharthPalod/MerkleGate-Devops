@@ -54,6 +54,8 @@ services:
     volumes:
       - merklegate_data:/app/data
       - merklegate_keys:/app/keys
+      - ./merklegate-privatekey.pem:/app/merklegate-privatekey.pem:ro
+      - ./.env:/app/.env:ro
     depends_on:
       redis:
         condition: service_healthy

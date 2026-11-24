@@ -25,6 +25,89 @@ import (
 	"merklegate/pkg/storage"
 )
 
+func loadEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			k := strings.TrimSpace(parts[0])
+			v := strings.TrimSpace(parts[1])
+			if os.Getenv(k) == "" {
+				os.Setenv(k, v)
+			}
+		}
+	}
+}
+
+func initGitHubAppClient() *githubapp.Client {
+	loadEnvFile(".env")
+
+	var appID int64
+	if idStr := os.Getenv("GITHUB_APP_ID"); idStr != "" {
+		fmt.Sscanf(strings.TrimSpace(idStr), "%d", &appID)
+	}
+	if appID == 0 {
+		if idStr := os.Getenv("GitHub-APPID"); idStr != "" {
+			fmt.Sscanf(strings.TrimSpace(idStr), "%d", &appID)
+		}
+	}
+	if appID == 0 {
+		if b, err := os.ReadFile("data/keys/github-app-id.txt"); err == nil {
+			fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &appID)
+		}
+	}
+
+	if appID == 0 {
+		log.Printf("[GitHub App] No App ID configured; check runs disabled.")
+		return nil
+	}
+
+	var pemBytes []byte
+	candidates := []string{
+		os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
+		"merklegate-privatekey.pem",
+		"data/keys/github-app.pem",
+		"github-app.pem",
+	}
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
+			pemBytes = b
+			log.Printf("[GitHub App] Loaded private key from %s", p)
+			break
+		}
+	}
+
+	if len(pemBytes) == 0 {
+		if raw := os.Getenv("GITHUB_APP_PRIVATE_KEY"); raw != "" {
+			pemBytes = []byte(raw)
+		}
+	}
+
+	if len(pemBytes) == 0 {
+		log.Printf("[GitHub App] App ID %d found but private key .pem not found; check runs disabled.", appID)
+		return nil
+	}
+
+	client, err := githubapp.NewClient(appID, pemBytes)
+	if err != nil {
+		log.Printf("[GitHub App] Failed to initialize client: %v", err)
+		return nil
+	}
+
+	log.Printf("[GitHub App] Outbound Check Runs Client ACTIVE for App ID %d", appID)
+	return client
+}
+
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -244,9 +327,11 @@ func main() {
 	})
 
 	// 7. GitHub App Webhook Receiver & Manifest Onboarding
+	ghClient := initGitHubAppClient()
 	ghReceiver := githubapp.NewReceiver(githubapp.Config{
 		WebhookSecret: githubWebhookSecret,
 		Producer:      producer,
+		Client:        ghClient,
 	})
 	mux.Handle("/api/v1/webhooks/github", ghReceiver)
 
@@ -322,7 +407,8 @@ func main() {
           contents: "read",
           pull_requests: "read",
           actions: "read",
-          checks: "read"
+          checks: "write",
+          statuses: "write"
         },
         default_events: [
           "push",
