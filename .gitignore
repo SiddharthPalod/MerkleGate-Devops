@@ -28,6 +28,7 @@ keys/
 *.priv
 .env
 .env.*
+!.env.example
 
 # Container and volume artifacts
 redis_data/
