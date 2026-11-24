@@ -1,5 +1,5 @@
-# 🛡️ MerkleGate: Enterprise Multi-Tenant Verifiable Compliance Ledger
-
+# 🛡️ MerkleGate
+Enterprise Multi-Tenant Verifiable Compliance Ledger
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![RFC Standard](https://img.shields.io/badge/RFC-6962%20%7C%209162-blue.svg)](https://datatracker.ietf.org/doc/html/rfc6962)
 [![Cryptography](https://img.shields.io/badge/Signature-Ed25519%20STH-success.svg)](https://ed25519.cr.yp.to/)
