@@ -7,6 +7,7 @@ bin/
 *.dylib
 *.test
 *.out
+*.pem
 
 # Go workspace and dependencies
 go.work
